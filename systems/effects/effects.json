@@ -1,0 +1,18 @@
+[
+    {
+        "metadata": {
+            "description": "Damage effect"
+        },
+        "name": "Damage",
+        "type": "damage",
+        "trait": "health"
+    },
+    {
+        "metadata": {
+            "description": "Heal effect"
+        },
+        "name": "Heal",
+        "type": "heal",
+        "trait": "health"
+    }
+]
