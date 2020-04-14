@@ -3,7 +3,7 @@ import os, sys
 import uuid
 from ...base.events import EventListener
 from collections import namedtuple
-from functools import wraps
+from functools import wraps, partial
 
 
 class EffectException(Exception):
@@ -13,6 +13,7 @@ class EffectException(Exception):
     Args:
         msg (str): informative error message
     """
+
     def __init__(self, msg):
         self.msg = msg
 
@@ -53,6 +54,7 @@ class Effect():
         self.interval = interval
         self.ticks = ticks
         self.commit = None
+        self.events = EventListener()
 
     def __str__(self):
         return f"{self.name} ({self.type}): {self.metadata['description']}"
@@ -64,23 +66,38 @@ class Effect():
         self.trait = trait
         return self
 
+    def with_magnitude(self, magnitude):
+        self.magnitude = magnitude
+        return self
+
 class EffectFactory():
     """
     This will be responsible for creating Effects of various types.
     """
+
     repo = None
 
     @staticmethod
     def create(name):
-        if EffectFactory.repo.db[name]:
-            e = Effect(**EffectFactory.repo.db[name].data)
-            e.commit = EffectFactory.repo.db[name].func
+        row = EffectFactory.repo.db[name]
+
+        if row:
+            # build the Effect object
+            e = Effect(**row.data)
+            e.commit = row.func
+
+            # set up events on the Effect
+            if row.events:
+                for event, func in row.events.items():
+                    e.events.add_listener(event, func)
+
+            # done
             return e
         else:
             raise EffectException(
                 "Tried to create invalid Effect: {name}")
 
-EffectRepositoryRow = namedtuple('EffectRepositoryRow', ['data', 'func'])
+EffectRepositoryRow = namedtuple('EffectRepositoryRow', ['data', 'func', 'events'])
 
 class EffectRepository():
     """
@@ -100,13 +117,15 @@ class EffectRepository():
             if ename in self.db.keys():
                 raise EffectException(
                     "Duplicate Effect name in effects.json: {ename}")
-            self.db[ename] = EffectRepositoryRow(effect, None)
+            self.db[ename] = EffectRepositoryRow(effect, None, {})
 
     def load(self):
         dirname, _ = os.path.split(os.path.abspath(__file__))
         with open(os.path.join(dirname, 'effects.json')) as effects:
             self.data = json.load(effects)
     # alias reload to load method
+    # TODO: reload should do more checking to make sure it doesn't crash
+    # the MUD on error
     reload = load
 
     @property
@@ -116,7 +135,6 @@ class EffectRepository():
     def add_effect_implementation(self, name, func):
         try:
             row = self.db[name]
-            print(row)
         except KeyError:
             raise EffectException(
                 f"Tried to implement unknown Effect: {name}")
@@ -127,10 +145,37 @@ class EffectRepository():
             raise EffectException(
                 f"Unable to redefine Effect: {name}")
 
-    def implement(self, name):
+    def add_effect_event_implementation(self, name, event, func):
+        event = event.upper()
+
+        try:
+            row = self.db[name]
+        except KeyError:
+            raise EffectException(
+                f"Tried to implement Event for unknown Effect: {name}")
+
+        if event in row.events.keys():
+            raise EffectException(
+                f"Unable to redefine Effect Event: {name}:{event}")
+        else:
+            row.events[event] = func
+            self.db[name] = row._replace(events=row.events)
+
+    def implement(self, name, event={}):
+        # if event is None:
+        #     print("doing partial")
+        #     return partial(self.implement, name)
+
+        # event = event if event else {}
+
         @wraps(self, name)
         def decorator(effect_func):
-            self.add_effect_implementation(name, effect_func)
+            if event:
+                print("event was set")
+                self.add_effect_event_implementation(name, event, effect_func)
+            else:
+                print("got here")
+                self.add_effect_implementation(name, effect_func)
             return effect_func
 
         return decorator
@@ -142,4 +187,5 @@ class EffectRepository():
 
         TODO: Implement
         """
+
         raise NotImplementedError

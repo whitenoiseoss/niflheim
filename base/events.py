@@ -25,8 +25,9 @@ class EventListener():
         self.listeners = dict()
 
     def on_notify(self, event):
-        if event.type in self.listeners:
-            self.listeners[event.type](event.data)
+        query = event.type.upper()
+        if query in self.listeners:
+            self.listeners[query](event.data)
 
     def on_destroy(self):
         for p in self._publishers:
@@ -52,6 +53,9 @@ class EventListener():
 
     def remove_event_publisher(self, publisher):
         self._publishers.remove(publisher)
+
+    def all(self):
+        return self.listeners
 
 class EventPublisher():
     """
