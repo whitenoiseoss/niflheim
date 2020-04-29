@@ -1,9 +1,11 @@
 import json
 import os, sys
 import uuid
-from ...base.events import EventListener
-from collections import namedtuple
+from ...base.events import EventListener, EventTopic, EventFactory
+from collections import namedtuple, deque, OrderedDict
 from functools import wraps, partial
+
+from evennia import DefaultScript
 
 
 class EffectException(Exception):
@@ -25,7 +27,7 @@ class Effect():
     Args:
         name (str): Name of the Effect
         type (str): Type of the Effect
-        magnitude (int): Strength of Effect
+        power (int): Strength of Effect
         trait (str): Trait (Stat, Skill, etc) that is affected
         refreshable (bool): Whether or not a second cast will refresh
         stackable (bool): Multiple applications are allowed
@@ -36,7 +38,7 @@ class Effect():
         commit (func): Method gets assigned here on implementation
     """
 
-    def __init__(self, metadata, name, type, trait, magnitude=0,
+    def __init__(self, metadata, name, type, trait, power=0,
                  refreshable=False, stackable=False, stacks=1, 
                  unique=False, interval=0, ticks=1):
         self.metadata = metadata
@@ -45,7 +47,7 @@ class Effect():
                 "Required key not found in metadata: 'description'")
         self.name = name
         self.type = type
-        self.magnitude = magnitude
+        self.power = power
         self.trait = trait
         self.refreshable = refreshable
         self.stackable = stackable
@@ -54,20 +56,20 @@ class Effect():
         self.interval = interval
         self.ticks = ticks
         self.commit = None
-        self.events = EventListener()
+        self.events = EventListener(self)
 
     def __str__(self):
         return f"{self.name} ({self.type}): {self.metadata['description']}"
 
-    def __call__(self):
-        self.commit(self)
+    def __call__(self, **data):
+        self.commit(self, data)
 
     def for_trait(self, trait):
         self.trait = trait
         return self
 
-    def with_magnitude(self, magnitude):
-        self.magnitude = magnitude
+    def with_power(self, power):
+        self.power = power
         return self
 
 class EffectFactory():
@@ -89,13 +91,113 @@ class EffectFactory():
             # set up events on the Effect
             if row.events:
                 for event, func in row.events.items():
-                    e.events.add_listener(event, func)
+                    e.events.add_event_listener(event, func)
 
             # done
             return e
         else:
             raise EffectException(
                 "Tried to create invalid Effect: {name}")
+
+class EffectHandler():
+    """
+    This is an Abstract Base Class that will be re-implemented on
+    various types of objects. It will provide the basis for how
+    Effects are added/removed to/from objects in the game.
+    """
+
+    def __init__(self, obj):
+        self._dict = OrderedDict()
+        self.obj = obj
+        self.topic = EventTopic(f"{self.obj.name}-EffectHandler")
+        self.prioritized = False # TODO: implement optional prioritization
+
+    def add(self, effect, priority=0, **data):
+        # index effects by type
+        idx = effect.type
+        # if the type is not in here, we create
+        # the entry for it
+        if idx not in self._dict:
+            if effect.unique:
+                self._dict[idx] = deque([], 1)
+            else:
+                self._dict[idx] = deque()
+
+        # if it IS already in, we have several
+        # checks to do
+        if idx in self._dict:
+            # stackable doesn't depend on or decide anything, so we can safely do it
+            # first
+            if effect.stackable:
+                # TODO: Implement a _stack_effect to copy certain values over
+                # to new effect
+                pass
+            if effect.unique:
+                if effect.refreshable:
+                    # TODO: Implement a _refresh_effect to copy certain values over
+                    # to new effect, that way stacks would not be lost on refresh
+                    self._dict[idx].appendleft(effect)
+                    self.emit_to(effect, "REFRESHED", data)
+                else:
+                    return (False, "UNIQUE_NO_REFRESH")
+        self._dict[idx].appendleft(effect)
+        self.emit_to(effect, "APPLIED", data)
+
+    def remove(self, effect, **data):
+        idx = effect.type
+        if idx in self._dict:
+            self._dict[idx].pop()
+            self.emit_to(effect, "REMOVED", data)
+
+    def notify(self, event):
+        self.topic.notify(event)
+
+    def emit_to(self, effect, status, data):
+        data["self"] = effect
+        try:
+            source = data["source"]
+        except KeyError: 
+            source = self.obj
+
+        e = EventFactory.create(status, source=source, target=self.obj, data=data)
+
+        effect.events.on_notify(e)
+
+    def _get_types_by_priority(self, priority):
+        rlist = list()
+        for idx in self._dict.keys():
+            if idx[0] == priority:
+                rlist.append(idx[1])
+        
+        return sorted(rlist)
+
+    def _get_types_by_keyword(self, keyword):
+        rlist = list()
+        for idx in self._dict.keys():
+            if keyword in idx[1]:
+                rlist.append(idx)
+
+        return sorted(rlist, key=lambda t: t[1])
+
+    def _sort_dict(self, dictobj):
+        current = 0
+        sorted_dict = OrderedDict()
+        for x in sorted(self._dict.keys(), key=lambda t: t[0]):
+            priority = x[0]
+            if priority == current:
+                for etype in self._get_types_by_priority(priority):
+                    sorted_dict[(priority, etype)] = dictobj[(priority, etype)]
+                current += 1
+            else:
+                continue
+
+    @property
+    def len(self):
+        return len(self._dict)
+
+    @property
+    def length(self):
+        return len(self._dict)
 
 EffectRepositoryRow = namedtuple('EffectRepositoryRow', ['data', 'func', 'events'])
 
@@ -107,17 +209,32 @@ class EffectRepository():
     This also handles matching Effects to their method implementations,
     as well as making the database searchable.
     """
+    db = dict()
 
     def __init__(self):
         self.data = str()
-        self.db = dict()
+        self.uniques = set()
         self.load()
         for effect in self.data:
+            try:
+                # convert str -> boolean
+                if effect["unique"].lower() == "true":
+                    effect["unique"] = True
+                    # add it to uniques list if unique
+                    self.uniques.add(effect["type"])
+                else:
+                    effect["unique"] = False
+            except KeyError:
+                # it's not defined, so assume it's not unique
+                # and default to False
+                effect["unique"] = False
+
+            # add to effect DB 
             ename = effect["name"]
-            if ename in self.db.keys():
+            if ename in EffectRepository.db.keys():
                 raise EffectException(
                     "Duplicate Effect name in effects.json: {ename}")
-            self.db[ename] = EffectRepositoryRow(effect, None, {})
+            EffectRepository.db[ename] = EffectRepositoryRow(effect, None, {})
 
     def load(self):
         dirname, _ = os.path.split(os.path.abspath(__file__))
@@ -134,13 +251,13 @@ class EffectRepository():
 
     def add_effect_implementation(self, name, func):
         try:
-            row = self.db[name]
+            row = EffectRepository.db[name]
         except KeyError:
             raise EffectException(
                 f"Tried to implement unknown Effect: {name}")
 
         if row.func == None:
-            self.db[name] = row._replace(func=func)
+            EffectRepository.db[name] = row._replace(func=func)
         else:
             raise EffectException(
                 f"Unable to redefine Effect: {name}")
@@ -149,7 +266,7 @@ class EffectRepository():
         event = event.upper()
 
         try:
-            row = self.db[name]
+            row = EffectRepository.db[name]
         except KeyError:
             raise EffectException(
                 f"Tried to implement Event for unknown Effect: {name}")
@@ -159,26 +276,21 @@ class EffectRepository():
                 f"Unable to redefine Effect Event: {name}:{event}")
         else:
             row.events[event] = func
-            self.db[name] = row._replace(events=row.events)
+            EffectRepository.db[name] = row._replace(events=row.events)
 
     def implement(self, name, event={}):
-        # if event is None:
-        #     print("doing partial")
-        #     return partial(self.implement, name)
-
-        # event = event if event else {}
-
         @wraps(self, name)
         def decorator(effect_func):
             if event:
-                print("event was set")
                 self.add_effect_event_implementation(name, event, effect_func)
             else:
-                print("got here")
                 self.add_effect_implementation(name, effect_func)
             return effect_func
 
         return decorator
+
+    def is_unique(self, etype):
+        return etype in self.uniques
 
     def where(self, **search):
         """

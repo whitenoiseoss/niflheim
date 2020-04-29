@@ -5,7 +5,8 @@
         },
         "name": "Damage",
         "type": "damage",
-        "trait": "health"
+        "trait": "health",
+        "unique": "false"
     },
     {
         "metadata": {
@@ -14,5 +15,14 @@
         "name": "Heal",
         "type": "heal",
         "trait": "health"
+    },
+    {
+        "metadata": {
+            "description": "Burn effect"
+        },
+        "name": "Burn",
+        "type": "dot.burn",
+        "trait": "health",
+        "unique": "true"
     }
 ]
